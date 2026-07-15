@@ -1,188 +1,136 @@
 import os
 import re
-import logging
 import argparse
+import sys
+from pathlib import Path
 
-# --- CONFIGURAZIONE GLOBALE ---
-# Lista dei formati video da elaborare. È possibile aggiungere o rimuovere estensioni qui.
-VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.wmv', '.webm')
+# Estensioni consentite (Video e Sottotitoli) per evitare di toccare .nfo, .txt, ecc.
+ALLOWED_EXTENSIONS = {
+    '.mkv', '.mp4', '.avi', '.mov', '.flv', '.webm', '.ogm', '.m4v', '.ts', # Video
+    '.srt', '.ass', '.sub' # Sottotitoli
+}
 
-
-def setup_console_logging():
-    """
-    Imposta un logger semplice che scrive solo sulla console.
-    """
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(levelname)s: %(message)s',
+def clean_name(stem):
+    """Applica le trasformazioni al nome del file (senza estensione)."""
+    # 1. Sostituisce underscore con spazi
+    name = stem.replace('_', ' ')
+    
+    # 2. Sostituisce i punti con spazi, MA SOLO SE:
+    # - Non sono adiacenti a spazi bianchi (evita di toccare "02. Tokyo" o "fright. Plus")
+    # - Non sono punti decimali (evita "2.5")
+    # - Non sono parte di un'ellissi (evita "..", "...")
+    name = re.sub(r'(?<!\s)(?<!\.)(?!(?<=\d)\.(?=\d))\.(?!\.)(?!\s)', ' ', name)
+    
+    # 3. Corregge eventuali doppi punti accidentali (es. "more.." diventa "more.")
+    # ma preserva i tre punti "..." se presenti nel nome
+    name = re.sub(r'(?<!\.)\.\.(?!\.)', '.', name)
+    
+    # 4. Rimuove tag di release comuni (risoluzioni, audio, sorgenti, codec)
+    tags_pattern = re.compile(
+        r'\b(1080p|720p|480p|2160p|4k|'
+        r'bluray|blu-ray|bdrip|web-dl|webdl|webrip|hdtv|dvdrip|'
+        r'x264|x265|h264|h265|hevc|'
+        r'dual[- ]?audio|multi[- ]?audio|'
+        r'10[- ]?bit|8[- ]?bit)\b', 
+        re.IGNORECASE
     )
-
-
-def clean_filename(filename: str) -> str:
-    """
-    Applica una serie di regole di pulizia a un nome di file.
-    Rimuove i tag, formatta gli spazi e gestisce i trattini per standardizzare i nomi.
-
-    Args:
-        filename (str): Il nome del file originale (con estensione).
-
-    Returns:
-        str: Il nuovo nome del file, pulito secondo le regole.
-    """
-    # Separa il nome del file dalla sua estensione per evitare di modificarla
-    name, ext = os.path.splitext(filename)
+    name = tags_pattern.sub(' ', name)
     
-    # Rimuove gli indicatori di versione come "v2", "V3" etc. attaccati agli episodi.
-    name = re.sub(r'(S\d+E\d+|E\d+|S\d+)(v\d+)', r'\1', name, flags=re.IGNORECASE)
+    # 5. Rimuove eventuali parentesi rimaste vuote dopo la rimozione dei tag (es. "[ ]" o "( )")
+    name = re.sub(r'\[\s*\]|\(\s*\)', ' ', name)
     
-    # Rimuove ricorsivamente i tag come [Subs] o (1080p) dall'inizio o dalla fine del nome
-    while True:
-        stripped_name = name.strip()
-        pattern = r"^\s*(\[.*?\]|\(.*?\))\s*|\s*(\[.*?\]|\(.*?\))\s*$"
-        name = re.sub(pattern, '', stripped_name)
-        # Se non vengono apportate ulteriori modifiche, esce dal ciclo
-        if name == stripped_name:
-            break
-            
-    # Sostituisce gli underscore, spesso usati al posto degli spazi
-    name = name.replace('_', ' ')
+    # 6. Spazia i trattini se usati come separatori (es. "Anime- 01" -> "Anime - 01")
+    # Caso A: C'è già uno spazio su almeno un lato del trattino
+    name = re.sub(r'\s+-\s*|\s*-\s+', ' - ', name)
     
-    # Sostituisce i punti con spazi, ma solo se non sono seguiti da un numero.
-    # In questo modo "Ver1.1a" e "S01E18.5" sono protetti, ma "Serie.S01" viene corretto.
-    name = re.sub(r'\.(?!\d)', ' ', name)
+    # Caso B (Ottimizzato senza look-behind variabili): Separa lettera e numero
+    # 1. Almeno due cifre seguite da trattino e lettera (es: "03-It's" -> "03 - It's")
+    name = re.sub(r'(\d{2,})-([a-zA-Z])', r'\1 - \2', name)
+    # 2. Una cifra seguita da trattino e lettera MAIUSCOLA (es: "6-S00E09" -> "6 - S00E09")
+    # Questo preserva parole composte in romaji come "2-banme" o "3-gatsu"
+    name = re.sub(r'(\d)-([A-Z])', r'\1 - \2', name)
+    # 3. Una lettera seguita da trattino e numero (es: "Anime-01" -> "Anime - 01")
+    name = re.sub(r'([a-zA-Z])-(\d)', r'\1 - \2', name)
     
-    # --- Gestione intelligente dei trattini ---
+    # Regex per parentesi tonde o quadre SOLO all'inizio o alla fine
+    # Gestisce più gruppi di parentesi consecutivi (es: [Fansub][1080p]...)
+    start_pattern = re.compile(r'^(\s*(\[.*?\]|\(.*?\))\s*)+')
+    end_pattern = re.compile(r'(\s*(\[.*?\]|\(.*?\))\s*)+$')
     
-    # --- MODIFICA CHIAVE QUI ---
-    # Aggiorniamo i pattern per riconoscere numeri decimali come "18.5".
-    # Il pattern per un numero diventa \d+(?:\.\d+)? che significa "cifre seguite opzionalmente da un punto e altre cifre".
+    # 7. Rimuove i blocchi di parentesi a inizio e fine
+    name = start_pattern.sub('', name)
+    name = end_pattern.sub('', name)
     
-    # Pattern per l'identificativo dell'episodio (S01, Episode 50, Movie 01, S01E18.5 etc.)
-    EPISODE_ID_PATTERN = r'(?:S|E|Ep(?:isode)?\.?|Movie)\s*\d+(?:\.\d+)?'
+    # 8. Trim finale e pulizia spazi doppi interni
+    name = name.strip()
+    name = re.sub(r'\s+', ' ', name)
+    
+    return name
 
-    # Pattern per i trattini seguiti solo da numeri (es. "Yuru Yuri - 01" o "Serie - 01.5")
-    SIMPLE_NUMERIC_ID_PATTERN = r'\d+(?:\.\d+)?'
-
-    # Combinazione dei pattern in un'unica espressione per il lookahead,
-    # per proteggere qualsiasi ID da una modifica errata.
-    ANY_ID_PATTERN = f'(?:{EPISODE_ID_PATTERN}|{SIMPLE_NUMERIC_ID_PATTERN})'
-
-    # 1. Aggiunge spazi per i separatori di episodio (es. "Serie-S01" -> "Serie - S01")
-    name = re.sub(
-        r'\s*-\s*(' + EPISODE_ID_PATTERN + r')', 
-        r' - \1', 
-        name, 
-        flags=re.IGNORECASE
+def main():
+    # Configurazione Argparse
+    parser = argparse.ArgumentParser(description="Anime Renamer ricorsivo nella cartella corrente.")
+    parser.add_argument(
+        "--force", 
+        action="store_true", 
+        help="Esegue rinomina reale. Senza questo flag, viene eseguito solo un test (dry-run)."
     )
-    
-    # 2. Rimuove gli spazi attorno ai trattini che uniscono parole (es. "hanako - kun"),
-    #    ma lascia intatti i separatori di titolo/episodio.
-    name = re.sub(
-        r'(?<=[a-zA-Z])\s+-\s+(?!' + ANY_ID_PATTERN + r')(?=[a-zA-Z])', 
-        '-', 
-        name,
-        flags=re.IGNORECASE
-    )
+    args = parser.parse_args()
 
-    # Pulisce eventuali doppi spazi creati e rifila gli spazi iniziali/finali
-    name = re.sub(r'\s+', ' ', name).strip()
-    
-    # Riassembla il nome finale con la sua estensione originale
-    return f"{name}{ext}"
+    # Prende la cartella corrente (Current Working Directory)
+    root_path = Path.cwd()
+    script_name = Path(__file__).name # Nome di questo script per non rinominare se stesso
 
-
-def process_directory(root_dir: str, dry_run: bool = True):
-    """
-    Analizza ricorsivamente una directory e rinomina solo i file video.
-    Applica le regole di `clean_filename` a ogni file video trovato.
-
-    Args:
-        root_dir (str): Il percorso della directory da cui iniziare la scansione.
-        dry_run (bool): Se True, simula solo le operazioni senza modificare alcun file.
-    """
-    if dry_run:
-        logging.warning("--- ESECUZIONE IN MODALITÀ DRY-RUN (SIMULAZIONE) ---")
-        logging.info(f"Verranno cercati solo i file con queste estensioni: {VIDEO_EXTENSIONS}")
-        logging.warning("Nessun file sarà rinominato. Usa --force per applicare le modifiche.")
+    print(f"Cartella di lavoro: {root_path}")
+    if args.force:
+        print("--- MODALITÀ ESECUZIONE REALE ---\n")
     else:
-        logging.info("--- AVVIO ELABORAZIONE REALE ---")
-        logging.info(f"Elaborazione dei soli file con estensioni: {VIDEO_EXTENSIONS}")
-        
-    counters = {'processed_videos': 0, 'to_rename': 0, 'skipped_other_files': 0, 'errors': 0}
+        print("--- MODALITÀ DRY-RUN (Nessuna modifica) ---\n")
+        print("Usa il flag --force per applicare le modifiche.\n")
 
-    for dirpath, dirnames, filenames in os.walk(root_dir):
-        # Esclude le directory nascoste (es. .git)
-        dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+    count_renamed = 0
 
-        for filename in filenames:
-            is_video = filename.lower().endswith(VIDEO_EXTENSIONS)
+    # rglob('*') naviga ricorsivamente
+    for file_path in root_path.rglob('*'):
+        # Processa solo file video/sottotitoli consentiti, ignora lo script stesso
+        if (file_path.is_file() and 
+            file_path.name != script_name and 
+            file_path.suffix.lower() in ALLOWED_EXTENSIONS):
             
-            # Salta i file nascosti o che non sono video
-            if filename.startswith('.') or not is_video:
-                counters['skipped_other_files'] += 1
+            original_full_name = file_path.name
+            extension = file_path.suffix
+            
+            # Pulisce il nome
+            new_stem = clean_name(file_path.stem)
+            
+            # Se dopo la pulizia il nome è vuoto (es. il file era solo [Parentesi].mkv), 
+            # meglio non fare nulla per sicurezza
+            if not new_stem:
                 continue
 
-            counters['processed_videos'] += 1
-            old_filepath = os.path.join(dirpath, filename)
+            final_name = f"{new_stem}{extension}"
             
-            try:
-                new_filename = clean_filename(filename)
-                
-                # Se il nome è già corretto, passa al file successivo
-                if filename == new_filename:
-                    continue
-                
-                counters['to_rename'] += 1
-                
-                logging.info(f"[{'DRY-RUN' if dry_run else 'RINOMINA'}]")
-                logging.info(f"  Vecchio: {filename}")
-                logging.info(f"  Nuovo: {new_filename}")
-                
-                if not dry_run:
-                    new_filepath = os.path.join(dirpath, new_filename)
-                    if os.path.exists(new_filepath):
-                        logging.error(f"  -> ERRORE: Il file '{new_filename}' esiste già. Salto.")
-                        counters['errors'] += 1
-                        counters['to_rename'] -= 1
-                    else:
-                        os.rename(old_filepath, new_filepath)
+            # Procedi solo se il nome è cambiato
+            if final_name != original_full_name:
+                count_renamed += 1
+                if args.force:
+                    new_path = file_path.with_name(final_name)
+                    try:
+                        # Gestione conflitti (se il file esiste già)
+                        if new_path.exists():
+                            print(f"[SALTO] Esiste già: {final_name}")
+                        else:
+                            file_path.rename(new_path)
+                            print(f"[OK] {original_full_name} -> {final_name}")
+                    except Exception as e:
+                        print(f"[ERRORE] Su {original_full_name}: {e}")
+                else:
+                    print(f"[DRY-RUN] {original_full_name} -> {final_name}")
 
-            except Exception as e:
-                logging.error(f"  -> ERRORE INASPETTATO su {old_filepath}: {e}")
-                counters['errors'] += 1
-                if counters['to_rename'] > 0: counters['to_rename'] -= 1
-
-    logging.info("--- ELABORAZIONE COMPLETATA ---")
-    unchanged_videos = counters['processed_videos'] - counters['to_rename'] - counters['errors']
-    
-    if dry_run:
-        logging.info(f"File video analizzati: {counters['processed_videos']}")
-        logging.info(f"File che verrebbero rinominati: {counters['to_rename']}")
-        logging.info(f"File video già corretti: {unchanged_videos}")
+    if count_renamed == 0:
+        print("Nessun file da rinominare trovato.")
     else:
-        actually_renamed = counters['to_rename']
-        logging.info(f"File video effettivamente rinominati: {actually_renamed}")
-        logging.info(f"File video non modificati: {unchanged_videos}")
-    
-    logging.info(f"File totali ignorati (non video, di sistema): {counters['skipped_other_files']}")
-    if counters['errors'] > 0:
-        logging.warning(f"Errori riscontrati: {counters['errors']}")
-
+        print(f"\nOperazione completata. File elaborati: {count_renamed}")
 
 if __name__ == "__main__":
-    setup_console_logging()
-
-    parser = argparse.ArgumentParser(
-        description="Rinomina i file video di anime. Per impostazione predefinita, viene eseguito in modalità di simulazione.",
-        formatter_class=argparse.RawTextHelpFormatter
-    )
-    
-    parser.add_argument("directory", nargs='?', default=os.getcwd(), help="Opzionale: il percorso da analizzare. Se omesso, usa la directory corrente.")
-    
-    parser.add_argument("--force", action="store_true", help="Esegue la rinomina effettiva dei file. USARE CON CAUTELA.")
-
-    args = parser.parse_args()
-    
-    is_dry_run = not args.force
-    
-    process_directory(args.directory, dry_run=is_dry_run)
+    main()
